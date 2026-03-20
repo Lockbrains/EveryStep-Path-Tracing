@@ -1,0 +1,675 @@
+\documentclass[11pt,twocolumn]{article}
+
+% ---------- Geometry ----------
+\usepackage[margin=1in]{geometry}
+
+% ---------- Math ----------
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+
+% ---------- Typography ----------
+\usepackage{microtype}
+\usepackage[T1]{fontenc}
+
+% ---------- Tables & Figures ----------
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+
+% ---------- Algorithms ----------
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+
+% ---------- Colors & Links ----------
+\usepackage[dvipsnames]{xcolor}
+\usepackage[colorlinks=true,linkcolor=RoyalBlue,citecolor=OliveGreen,urlcolor=BrickRed]{hyperref}
+\usepackage{cleveref}
+
+% ---------- Lists ----------
+\usepackage{enumitem}
+
+% ---------- Bibliography ----------
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+% ---------- Theorem environments ----------
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+% ---------- Custom commands ----------
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Var}{\operatorname{Var}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Aspace}{\mathcal{A}}
+\newcommand{\Astar}{\mathcal{A}^{\ast}}
+\newcommand{\Pspace}{\bar{\mathcal{P}}}
+\newcommand{\pref}{p_{\text{ref}}}
+\newcommand{\pLLM}{p_{\text{LLM}}}
+\newcommand{\Qdirect}{Q_{\text{direct}}}
+\newcommand{\bx}{\mathbf{x}}
+\newcommand{\bn}{\mathbf{n}}
+
+% ================================================================
+\title{\textbf{EveryStep: Path Tracing the Agentic Workflow}\\[6pt]
+  \large Applying Monte Carlo Light Transport Theory \\
+  to LLM Agent Reliability Optimization}
+
+\author{%
+  (Authors)\\
+  \textit{Working Paper --- March 2026}
+}
+
+\date{}
+
+% ================================================================
+\begin{document}
+\maketitle
+
+% ================================================================
+\begin{abstract}
+Large Language Models are often dismissed as unreliable because each call is stochastic.
+We argue that this critique, while valid for single invocations, fundamentally misunderstands the problem:
+\emph{path tracing in computer graphics faces the exact same challenge and has solved it.}
+We propose a formal mapping between Monte Carlo light transport algorithms and LLM agentic workflows,
+grounded in three insights:
+(1)~LLM unreliability is a variance problem amenable to 60+ years of graphics variance reduction;
+(2)~the \emph{Point Light Theorem}: tasks whose correct answers occupy a zero-measure subset of the output space
+    require Next Event Estimation (NEE), mapping directly to RAG and tool use;
+(3)~a \emph{sampling efficiency} criterion $\eta_M = -\ln(1-p_M)/C_M$ determines when cheaper models
+    with more samples outperform expensive models.
+We derive the \emph{Agent Quality Equation} as an analogue of the rendering equation,
+formalize six variance reduction techniques
+(NEE, MIS, Russian Roulette, Importance Sampling, MLT, path-space MIS),
+prove two theorems on the necessity of NEE for ``point light'' tasks,
+and design experiments to validate the framework on Art Bible generation.
+\end{abstract}
+
+% ================================================================
+\section{Introduction}\label{sec:intro}
+
+\subsection{The ``Gacha'' Critique}
+
+A prevalent argument holds that because each LLM output is sampled from a distribution,
+the result is inherently unreliable.
+If a single call succeeds with probability $p$,
+trusting it means accepting failure rate $1-p$.
+This is correct---for a single sample.
+
+\subsection{Path Tracing: The Same Problem, Solved}
+
+Path tracing computes global illumination by shooting random rays into a scene.
+A single sample per pixel is noise.
+Yet modern renderers produce photorealistic images because
+\begin{equation}\label{eq:failure}
+  P(\text{failure after } N \text{ samples}) = (1-p)^N.
+\end{equation}
+For $p=0.5$, $N=10$: $(0.5)^{10} \approx 10^{-3}$, i.e.\ 99.9\% success.
+But path tracing goes far beyond naive repetition.
+Over six decades, the rendering community developed
+importance sampling, MIS~\citep{veach1995optimally},
+NEE, Russian Roulette, and MLT~\citep{veach1997metropolis}---each
+provably improving convergence under specific conditions.
+
+\subsection{Core Thesis and Research Questions}
+
+We propose that Monte Carlo light transport is \emph{directly transferable}
+to LLM agentic workflows:
+\begin{enumerate}[label=\textbf{RQ\arabic*},leftmargin=2em]
+  \item Can path tracing algorithms systematically improve industry-level agent performance?
+  \item Which rendering concepts map onto which agent concepts, and where does the analogy break?
+  \item Can variance reduction enable cheaper models to outperform expensive ones at fixed budget?
+  \item Are these optimizations generalizable across modalities and task types?
+\end{enumerate}
+
+\subsection{Art Bible as Target Application}
+
+An Art Bible is a comprehensive visual style guide for a creative project.
+It is a long-chain stochastic process (world-building $\to$ color $\to$ material $\to$ character $\to$ \ldots),
+each step depending on all predecessors.
+Correctness is defined by a \emph{range} (not a point), analogous to diffuse surfaces.
+Global consistency is required, analogous to energy conservation.
+
+% ================================================================
+\section{Mathematical Foundations}\label{sec:math}
+
+\subsection{The Rendering Equation}
+
+\citet{kajiya1986rendering} introduced the rendering equation:
+\begin{equation}\label{eq:rendering}
+  L_o(\bx, \omega_o) = L_e(\bx, \omega_o)
+    + \int_\Omega f_r(\bx, \omega_i, \omega_o)\,
+      L_i(\bx, \omega_i)\,
+      (\omega_i \cdot \bn)\,d\omega_i
+\end{equation}
+where $L_o$ is outgoing radiance, $L_e$ is emission,
+$f_r$ is the BRDF, $L_i$ is incoming radiance,
+and $(\omega_i \cdot \bn)$ the cosine term over hemisphere $\Omega$.
+
+\subsection{The Agent Quality Equation}
+
+We propose the \emph{Agent Quality Equation} as a direct analogue:
+\begin{equation}\label{eq:agent-quality}
+  Q(s_k) = \Qdirect(s_k)
+    + \int_{\Aspace} T(s_k, a)\,Q(s_{k+1}(a))\,p(a \mid s_k)\,da
+\end{equation}
+where:
+\begin{itemize}[nosep]
+  \item $Q(s_k)$: total quality at state $s_k$ \quad($\leftrightarrow L_o$)
+  \item $\Qdirect(s_k)$: direct contribution \quad($\leftrightarrow L_e$)
+  \item $T(s_k, a)$: transfer function \quad($\leftrightarrow f_r$)
+  \item $Q(s_{k+1}(a))$: quality from continuation \quad($\leftrightarrow L_i$)
+  \item $p(a \mid s_k)\,da$: LLM probability measure \quad($\leftrightarrow (\omega_i\!\cdot\!\bn)\,d\omega_i$)
+  \item $\Aspace$: action space \quad($\leftrightarrow \Omega$)
+\end{itemize}
+
+The recursive structure is identical: a second-kind Fredholm integral equation
+where total quality equals direct contribution plus the integral over all continuations,
+weighted by transfer and probability.
+
+\subsection{Path Integral Formulation}
+
+Following \citet{veach1997robust}, we reformulate in path space.
+A rendering path $\bar{x} = (x_0, \ldots, x_K)$ contributes:
+\begin{equation}\label{eq:veach-path}
+  I = \int_{\bar\Omega} f(\bar{x})\,d\mu(\bar{x})
+\end{equation}
+
+An \emph{agent execution path}
+$\bar{p} = (s_0, a_0, s_1, a_1, \ldots, s_K)$ contributes:
+\begin{equation}\label{eq:agent-path}
+  \mathcal{Q} = \int_{\Pspace} F(\bar{p})\,d\nu(\bar{p})
+\end{equation}
+where
+\begin{align}
+  F(\bar{p}) &= Q_{\text{final}}(\bar{p}) \cdot \prod_{k=0}^{K-1} T(s_k, a_k) \label{eq:path-throughput} \\
+  d\nu(\bar{p}) &= \prod_{k=0}^{K-1} p(a_k \mid s_k)\,da_k \label{eq:path-measure}
+\end{align}
+
+\subsection{Monte Carlo Estimation}\label{sec:mc-basics}
+
+The basic MC estimator for $\mathcal{Q}$:
+\begin{equation}\label{eq:mc-estimator}
+  \hat{\mathcal{Q}}_N = \frac{1}{N}\sum_{i=1}^{N} \frac{F(\bar{p}_i)}{p(\bar{p}_i)}
+\end{equation}
+with $\bar{p}_i \overset{\text{iid}}{\sim} p$.
+The variance is
+\begin{equation}\label{eq:mc-variance}
+  \Var[\hat{\mathcal{Q}}_N]
+    = \frac{1}{N}\,\Var\!\left[\frac{F(\bar{p})}{p(\bar{p})}\right]
+    = \frac{\sigma^2}{N}
+\end{equation}
+
+\begin{remark}
+Variance converges as $O(1/N)$.
+Halving the standard deviation requires $4\times$ samples.
+All techniques in \cref{sec:algorithms} aim to reduce $\sigma^2$,
+thereby achieving better convergence per sample.
+\end{remark}
+
+\subsection{Sampling Efficiency Criterion}\label{sec:efficiency}
+
+Let model $M$ have per-sample cost $C_M$ and success probability $p_M$.
+After $N$ samples:
+\begin{equation}\label{eq:success-prob}
+  P_{\text{success}}(N) = 1 - (1-p_M)^N
+\end{equation}
+
+Under budget $B$, affordable samples: $N = \lfloor B/C_M \rfloor$.
+Small model $M_s\;(p_s, C_s)$ dominates large $M_l\;(p_l, C_l)$ when:
+\begin{equation}\label{eq:dominance}
+  (1-p_s)^{B/C_s} < (1-p_l)^{B/C_l}
+\end{equation}
+Taking logarithms and rearranging:
+
+\begin{definition}[Sampling Efficiency]\label{def:efficiency}
+\begin{equation}\label{eq:eta}
+  \boxed{\eta_M = \frac{-\ln(1-p_M)}{C_M}}
+\end{equation}
+When $p_M \ll 1$, $\eta_M \approx p_M / C_M$.
+The model with higher $\eta$ is preferred at any budget.
+\end{definition}
+
+This formalizes the finding of \citet{brown2024monkeys}: 5 small-model samples
+can outperform 1 GPT-4o sample because $\eta_{\text{small}} > \eta_{\text{large}}$.
+
+% ================================================================
+\section{Core Algorithms}\label{sec:algorithms}
+
+\subsection{Next Event Estimation (NEE)}\label{sec:nee}
+
+\subsubsection{The Point Light Problem in Rendering}
+
+A point light occupies zero solid angle:
+\begin{equation}\label{eq:point-light-measure}
+  \mu\bigl(\{\omega \in \Omega : \omega \text{ hits point light}\}\bigr) = 0
+\end{equation}
+Pure path tracing \emph{never} finds it.
+NEE solves this by explicit light sampling:
+\begin{equation}\label{eq:nee-rendering}
+  \hat{L}_{\text{NEE}}(\bx) = \sum_{l \in \mathcal{L}}
+    \frac{f_r(\bx, \omega_l, \omega_o)\,L_e(\bx_l)\,G(\bx, \bx_l)}{p_{\text{light}}(\bx_l)}
+    \cdot V(\bx, \bx_l)
+\end{equation}
+where $G(\bx,\bx_l) = \frac{|\cos\theta_x||\cos\theta_l|}{\|\bx - \bx_l\|^2}$
+is the geometry term and $V \in \{0,1\}$ the visibility (shadow ray).
+
+\subsubsection{Agent NEE}
+
+``Point lights'' in agentic workflows are tasks with
+$\mu(\{a \in \Aspace : a \text{ is correct}\}) \approx 0$:
+exact API parameters, strict JSON schemas, precise computations.
+
+\emph{NEE-Agent} explicitly connects to reference sources:
+\begin{equation}\label{eq:nee-agent}
+  \hat{Q}_{\text{NEE}}(s_k)
+    = \Qdirect(s_k)
+    + \frac{T(s_k, a^*)\,Q^*(s_{k+1})}{\pref(a^*)}
+      \cdot \mathbb{1}[\operatorname{valid}(a^*, s_k)]
+\end{equation}
+where $a^* \sim \pref$ (RAG, tool call, verified exemplar)
+and $\mathbb{1}[\operatorname{valid}(\cdot)]$ acts as the shadow ray.
+
+\subsection{Multiple Importance Sampling (MIS)}\label{sec:mis}
+
+\subsubsection{Balance Heuristic}
+
+Given $n$ strategies with $n_i$ samples from $p_i$
+\citep{veach1995optimally}:
+\begin{equation}\label{eq:mis}
+  \hat{F}_{\text{MIS}} = \sum_{i=1}^{n} \frac{1}{n_i}
+    \sum_{j=1}^{n_i} w_i(X_{i,j})\,\frac{f(X_{i,j})}{p_i(X_{i,j})}
+\end{equation}
+with the balance heuristic weight:
+\begin{equation}\label{eq:balance}
+  w_i(x) = \frac{n_i\,p_i(x)}{\sum_{k=1}^{n} n_k\,p_k(x)}
+\end{equation}
+
+\begin{theorem}[Veach's Variance Bound {\citep{veach1995optimally}}]\label{thm:veach-bound}
+For the balance heuristic with $\sum_i n_i = N$:
+\begin{equation}\label{eq:veach-bound}
+  \Var[\hat{F}_{\mathrm{MIS}}]
+    \leq \frac{1}{\min_i n_i}
+    \left(\int |f(x)|\,dx\right)^{\!2}
+\end{equation}
+\end{theorem}
+
+The \emph{power heuristic} ($\beta = 2$) often improves upon this:
+\begin{equation}\label{eq:power-heuristic}
+  w_i^{(\beta)}(x) = \frac{(n_i\,p_i(x))^\beta}{\sum_{k=1}^{n}(n_k\,p_k(x))^\beta}
+\end{equation}
+
+\subsubsection{Agent MIS}
+
+Three fundamental strategies:
+\begin{enumerate}[nosep]
+  \item $p_1$: Free LLM generation (BSDF sampling)
+  \item $p_2$: RAG-guided generation (light sampling / NEE)
+  \item $p_3$: Tool/API calls (delta distribution)
+\end{enumerate}
+\begin{equation}\label{eq:agent-mis}
+  \hat{Q}_{\text{MIS}}(s_k) = \sum_{i=1}^{3} \frac{1}{n_i}
+    \sum_{j=1}^{n_i}
+    \frac{n_i\,p_i(a_{i,j})}{\sum_{m=1}^{3} n_m\,p_m(a_{i,j})}
+    \cdot \frac{F(a_{i,j})}{p_i(a_{i,j})}
+\end{equation}
+
+MIS automatically allocates credit to the best strategy per sample---handling
+the entire task spectrum from ``diffuse'' to ``point light'' without manual tuning.
+
+\subsection{Russian Roulette}\label{sec:rr}
+
+At bounce $k$ with throughput $\beta_k$:
+\begin{equation}\label{eq:rr}
+  \hat{L} = \begin{cases}
+    L_{\text{cont}} / q_k & \text{w.p.\ } q_k \\
+    0 & \text{w.p.\ } 1-q_k
+  \end{cases}
+\end{equation}
+where $q_k = \min(\|\beta_k\|, 1)$.
+
+\begin{proposition}[Unbiasedness of Russian Roulette]\label{prop:rr-unbiased}
+$\E[\hat{L}] = q_k \cdot \frac{L}{q_k} + (1-q_k) \cdot 0 = L$.
+\end{proposition}
+
+\subsubsection{Agent Russian Roulette}
+
+A Validator Agent evaluates partial quality $Q_k \in [0,1]$:
+\begin{equation}\label{eq:agent-rr}
+  q_k = \min\!\left(\frac{Q_k}{Q_{\text{threshold}}},\,1\right)
+\end{equation}
+Low-quality paths terminate early; survivors are upweighted by $1/q_k$.
+The variance increase is bounded:
+\begin{equation}\label{eq:rr-var-bound}
+  \Var_{\text{RR}} \leq \Var_{\text{no-RR}} \cdot \left(\frac{1}{q_k} - 1\right)
+\end{equation}
+which is small for $q_k \approx 1$ (good paths).
+
+\subsection{Importance Sampling}\label{sec:is}
+
+The zero-variance IS PDF:
+\begin{equation}\label{eq:optimal-is}
+  q^*(x) = \frac{|f(x)|\,p(x)}{\int |f(x')|\,p(x')\,dx'}
+\end{equation}
+
+\subsubsection{Agent IS via Constraint Buffer}
+
+Extract constraints $\mathcal{C}_k = \{c_1, \ldots, c_m\}$ from step $k$,
+then bias step $k{+}1$:
+\begin{equation}\label{eq:guided}
+  p_{\text{guided}}(a \mid s_{k+1})
+    \propto \pLLM(a \mid s_{k+1}) \cdot \prod_{j=1}^{m} \phi(a, c_j)
+\end{equation}
+where $\phi(a, c_j) \geq 0$ is a compatibility score.
+This concentrates sampling in high-quality regions,
+approximating importance sampling.
+
+\subsection{Metropolis Light Transport (MLT)}\label{sec:mlt}
+
+Given path $\bar{p}$ with quality $F(\bar{p})$,
+propose mutation $\bar{p}' \sim T(\bar{p}' \mid \bar{p})$.
+Accept with \citet{metropolis1953equation,hastings1970monte} probability:
+\begin{equation}\label{eq:mh}
+  \alpha(\bar{p}' \mid \bar{p})
+    = \min\!\left(1,\,
+      \frac{F(\bar{p}')\,T(\bar{p} \mid \bar{p}')}{F(\bar{p})\,T(\bar{p}' \mid \bar{p})}
+    \right)
+\end{equation}
+For symmetric proposals:
+\begin{equation}\label{eq:mh-symmetric}
+  \alpha = \min\!\left(1,\,\frac{F(\bar{p}')}{F(\bar{p})}\right)
+\end{equation}
+
+\subsubsection{Agent MLT: Mutation-Based Document Refinement}
+
+\begin{algorithm}[H]
+\SetAlgoLined
+\KwIn{Initial draft $\bar{p}_0$, iterations $M$, quality function $F$}
+\KwOut{Refined document $\bar{p}_{\text{best}}$}
+$\bar{p}_{\text{best}} \leftarrow \bar{p}_0$\;
+\For{$t = 1$ \KwTo $M$}{
+  Select section index $j$ uniformly at random\;
+  $\bar{p}' \leftarrow \text{Mutate}(\bar{p}_{\text{current}}, j)$ \tcp*{LLM revises section $j$}
+  $\alpha \leftarrow \min(1,\; F(\bar{p}') / F(\bar{p}_{\text{current}}))$\;
+  \With{probability $\alpha$}{
+    $\bar{p}_{\text{current}} \leftarrow \bar{p}'$\;
+    \If{$F(\bar{p}') > F(\bar{p}_{\text{best}})$}{
+      $\bar{p}_{\text{best}} \leftarrow \bar{p}'$\;
+    }
+  }
+}
+\Return $\bar{p}_{\text{best}}$\;
+\caption{Agent MLT for Document Refinement}
+\label{alg:mlt}
+\end{algorithm}
+
+The Markov chain converges to a stationary distribution $\pi(\bar{p}) \propto F(\bar{p})$,
+spending more time in high-quality document regions.
+
+% ================================================================
+\section{The Point Light Theorem}\label{sec:point-light}
+
+This section contains the sharpest theoretical contribution.
+
+\begin{definition}[Agent Point Light]\label{def:point-light}
+A task exhibits the \emph{point light property} if the correct output set
+$\Astar \subset \Aspace$ satisfies
+\begin{equation}
+  \mu(\Astar) = 0
+\end{equation}
+under the LLM's output measure $\mu$ induced by $p(\cdot \mid s)$.
+
+More practically, a task is \emph{$\epsilon$-point-light} if
+$\mu(\Astar) < \epsilon$ for $\epsilon \ll 1$.
+\end{definition}
+
+\begin{definition}[Task Reflectance Spectrum]\label{def:spectrum}
+Tasks are classified along a continuous spectrum:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+BRDF Type & $\mu(\Astar)$ & Example \\
+\midrule
+Diffuse & $\approx \mu(\Aspace)$ & ``Write a poem'' \\
+Glossy & $\ll \mu(\Aspace)$ & ``Write an Art Bible'' \\
+Specular & single point & ``$\int_0^1 x^2\,dx = \;?$'' \\
+Point light & $= 0$ & Exact API call \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{definition}
+
+\begin{theorem}[Unreachability by Pure Sampling]\label{thm:unreachable}
+For a task with the point light property,
+the naive MC estimator $\hat{Q}_N$ satisfies:
+\begin{equation}\label{eq:unreachable}
+  P\!\left(\exists\, i \leq N : a_i \in \Astar\right) = 0
+  \quad \forall\, N \in \N
+\end{equation}
+when $a_i \sim p(\cdot \mid s)$ and $\mu(\Astar) = 0$.
+\end{theorem}
+
+\begin{proof}
+Each $a_i$ is drawn independently from $p(\cdot \mid s)$,
+which induces measure $\mu$.
+Since $\mu(\Astar) = 0$, we have $P(a_i \in \Astar) = 0$ for each $i$.
+By countable subadditivity:
+\begin{equation*}
+  P\!\left(\bigcup_{i=1}^{N} \{a_i \in \Astar\}\right)
+    \leq \sum_{i=1}^{N} P(a_i \in \Astar) = 0
+    \qedhere
+\end{equation*}
+\end{proof}
+
+\begin{theorem}[NEE Reachability]\label{thm:nee-reach}
+If there exists a reference distribution $\pref$ with
+$\pref(\Astar) > 0$, then the NEE-Agent estimator satisfies:
+\begin{equation}\label{eq:nee-reach}
+  \E\bigl[\hat{Q}_{\text{NEE}}\bigr] > 0
+  \quad \text{and} \quad
+  \Var\bigl[\hat{Q}_{\text{NEE}}\bigr] < \infty
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+The NEE estimator draws $a^* \sim \pref$ and evaluates
+$T(s, a^*)\,Q^*(s')/\pref(a^*)$.
+Since $\pref(\Astar) > 0$, the event $\{a^* \in \Astar\}$ has positive probability.
+For correct actions, $T(s, a^*) > 0$ and $Q^*(s') > 0$, so:
+\begin{equation*}
+  \E\bigl[\hat{Q}_{\text{NEE}}\bigr]
+    \geq \pref(\Astar) \cdot \inf_{a^* \in \Astar}
+      \frac{T(s, a^*)\,Q^*(s')}{\pref(a^*)} > 0
+\end{equation*}
+For finite variance, we require $T \cdot Q^* / \pref$ to be square-integrable
+w.r.t.\ $\pref$.
+Since $\pref$ has support on $\Astar$ and $T, Q^*$ are bounded,
+$\E[(T \cdot Q^* / \pref)^2] < \infty$.
+\end{proof}
+
+\begin{corollary}[Necessity of NEE]\label{cor:nee-necessary}
+For tasks with $\mu(\Astar) = 0$,
+NEE-style direct sampling (RAG, tool calls, verified references)
+is a \textbf{necessary condition} for non-zero expected quality.
+No amount of random sampling suffices.
+\end{corollary}
+
+\subsection{The MIS Bridge}\label{sec:mis-bridge}
+
+In rendering, MIS handles mixed scenes (diffuse + point lights) by combining
+BSDF sampling with NEE.
+The balance heuristic automatically zeros contributions from strategies
+assigning zero probability.
+
+\begin{proposition}[Agent MIS handles the full spectrum]\label{prop:mis-spectrum}
+For a task with both ``diffuse'' components (many valid outputs)
+and ``point light'' components (exact answers),
+the Agent MIS estimator~\eqref{eq:agent-mis} with strategies
+$p_1$ (free), $p_2$ (RAG), $p_3$ (tool)
+satisfies:
+\begin{equation}
+  \E[\hat{Q}_{\text{MIS}}] = \mathcal{Q}
+\end{equation}
+(unbiased), with variance no greater than $O(1/\min_i n_i)$ times the
+integral of $|F|$ squared (\cref{thm:veach-bound}).
+\end{proposition}
+
+\begin{proof}
+Unbiasedness follows from the MIS weights summing to 1 for each sample point:
+$\sum_i w_i(x) = 1$.
+The variance bound is a direct application of \cref{thm:veach-bound}.
+For point-light components, $p_1(a^*) = 0$ so $w_1(a^*) = 0$;
+all weight falls on $p_3$ (tools), exactly as light sampling dominates
+for point lights in rendering.
+\end{proof}
+
+% ================================================================
+\section{Conceptual Mapping}\label{sec:mapping}
+
+\begin{table*}[t]
+\centering
+\caption{Complete mapping between path tracing and agentic workflow concepts.}
+\label{tab:mapping}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Path Tracing} & \textbf{Math} & \textbf{Agent Workflow} & \textbf{Math} \\
+\midrule
+Ray & $r(t) = \mathbf{o} + t\mathbf{d}$ & Single invocation & $a \sim p(\cdot \mid s)$ \\
+Path & $\bar{x} = (x_0,\ldots,x_K)$ & Execution chain & $\bar{p} = (s_0,a_0,\ldots,s_K)$ \\
+Radiance & $L(\bx, \omega)$ & Output quality & $Q(s)$ \\
+BRDF & $f_r(\bx, \omega_i, \omega_o)$ & Transfer function & $T(s, a)$ \\
+Rendering eq.\ & Eq.~\eqref{eq:rendering} & Quality eq.\ & Eq.~\eqref{eq:agent-quality} \\
+SPP & $N$ rays/pixel & Samples/task & $N$ calls/task \\
+Point light & $\mu = 0$ & Exact-answer task & $\mu(\Astar) = 0$ \\
+NEE & Light sampling & Ref-guided gen.\ & RAG + tools \\
+BSDF sampling & $\omega \sim f_r$ & Free generation & $a \sim \pLLM$ \\
+MIS & Weighted combo & Multi-strategy & Weighted combo \\
+Russian Roulette & Stochastic term.\ & Validator pruning & Quality-based stop \\
+Importance Sampling & Guide toward $f$ & Constraint Buffer & Structured prompting \\
+MLT & MCMC mutation & Doc refinement & Section-wise revision \\
+BVH & Spatial index & Knowledge index & Vector DB \\
+Environment map & Precomputed illum.\ & Reference KB & Curated exemplars \\
+Denoising & Post-process & Result refinement & Synthesis agent \\
+Energy conservation & $\int f_r \leq 1$ & Quality bound & $T(s,a) \leq 1$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+% ================================================================
+\section{Experimental Design}\label{sec:experiments}
+
+\subsection{Experiment 0: Point Light Validation}
+
+\textbf{Hypothesis}: For near-zero-measure tasks,
+NEE is necessary; pure sampling fails $\forall N$.
+
+\begin{itemize}[nosep]
+  \item \textbf{Task}: Strict JSON schema, precise API calls
+  \item \textbf{Methods}: Pure sampling ($N \in \{1,10,100,1000\}$),
+    NEE only, MIS
+  \item \textbf{Models}: GPT-4o-mini, Claude Haiku, Gemini Flash
+  \item \textbf{Metrics}: Exact match, schema pass rate
+\end{itemize}
+
+\subsection{Experiment 1: Basic Monte Carlo}
+
+Validate $O(1/N)$ convergence on simplified Art Bible sections.
+$N \in \{1,4,16,64,256\}$ across small vs.\ large models.
+Selection via best-of-$N$ and majority voting.
+
+\subsection{Experiment 2: Russian Roulette}
+
+5-step Art Bible chain with RR at $Q_{\text{threshold}} \in \{0.3, 0.5, 0.7\}$.
+Measure token consumption vs.\ quality.
+
+\subsection{Experiment 3: Importance Sampling}
+
+Compare unconstrained vs.\ Constraint Buffer generation.
+Measure variance of quality scores and convergence speed.
+
+\subsection{Experiment 4: MLT Mutation}
+
+Compare full regeneration ($N\times$) vs.\
+MLT ($1 + (N{-}1)$ mutations) on full Art Bible.
+Metric: quality after $N$ total calls.
+
+\subsection{Experiment 5: MIS Multi-Strategy}
+
+Mixed-difficulty Art Bible.
+Free only vs.\ RAG only vs.\ Tool only vs.\ MIS ($N/3$ each).
+
+\subsection{Experiment 6: Sampling Efficiency}
+
+Fixed budgets $B \in \{1, 5, 10, 50\}$ USD.
+Small models (mini/Haiku/Flash) vs.\ large (4o/Sonnet/Pro).
+Measure quality and empirical $\eta_M$.
+
+% ================================================================
+\section{Discussion}\label{sec:discussion}
+
+\subsection{Where the Analogy Holds}
+
+Both~\eqref{eq:rendering} and~\eqref{eq:agent-quality} are
+Fredholm equations of the second kind.
+All variance reduction techniques depend only on integral structure,
+not physical interpretation.
+
+\subsection{Where the Analogy Breaks}
+
+\begin{itemize}[nosep]
+  \item \textbf{Energy conservation}: LLMs can amplify errors ($T > 1$).
+  \item \textbf{BRDF reciprocity}: No agent analogue.
+  \item \textbf{Deterministic geometry}: Agent state transitions are stochastic.
+  \item \textbf{Continuous space}: Agent output is mixed continuous/discrete.
+  \item \textbf{Known lights}: Correct answers are usually unknown a priori.
+\end{itemize}
+
+\subsection{The Verifier as Shadow Ray}
+
+The Validator Agent maps to the \emph{shadow ray}:
+both are binary functions gating a sample's contribution.
+The quality scorer maps to throughput measurement.
+
+\subsection{Subsuming Existing Approaches}
+
+Best-of-$N$ = basic MC;
+Self-Consistency = MC + majority vote;
+Tree-of-Thought = MCTS;
+RAG = NEE;
+Tool use = point light sampling;
+Fork-Merge = parallel paths + MIS;
+Sherlock = RR with counterfactual $q_k$.
+
+The unifying perspective: \textbf{all are specific instances of
+Monte Carlo variance reduction applied to the agent quality integral.}
+
+% ================================================================
+\section{Conclusion}\label{sec:conclusion}
+
+We have established a rigorous mathematical mapping between
+Monte Carlo light transport and LLM agentic workflows.
+The Agent Quality Equation~\eqref{eq:agent-quality} provides
+a unifying framework under which existing techniques
+(Best-of-$N$, self-consistency, RAG, tool use)
+emerge as special cases of well-studied variance reduction methods.
+
+The Point Light Theorem (\cref{thm:unreachable,thm:nee-reach})
+provides the sharpest result:
+for tasks where correct answers occupy a zero-measure set,
+no amount of random sampling suffices---NEE-style approaches
+are a mathematical necessity.
+
+We believe the rendering community's decades of experience
+with stochastic methods represent an untapped source of algorithms
+for the AI agent era.
+
+% ================================================================
+\bibliography{references}
+
+\end{document}
