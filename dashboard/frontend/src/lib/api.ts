@@ -56,27 +56,28 @@ export async function startPipeline(
 export function streamPipeline(
   runId: string,
   onEvent: (event: PipelineEvent) => void,
+  onDone?: () => void,
   onStreamError?: () => void,
 ): () => void {
   const es = createSSEStream(`/api/pipeline/stream/${runId}`);
-  const handler = (ev: MessageEvent) => {
+  es.onmessage = (ev: MessageEvent) => {
     try {
-      onEvent(JSON.parse(ev.data) as PipelineEvent);
+      const parsed = JSON.parse(ev.data) as PipelineEvent;
+      if (parsed.event_type === "done") {
+        onDone?.();
+        es.close();
+        return;
+      }
+      onEvent(parsed);
     } catch {
       /* ignore malformed chunks */
     }
   };
-  const onError = () => {
+  es.onerror = () => {
     onStreamError?.();
     es.close();
   };
-  es.addEventListener("message", handler);
-  es.addEventListener("error", onError);
-  return () => {
-    es.removeEventListener("message", handler);
-    es.removeEventListener("error", onError);
-    es.close();
-  };
+  return () => es.close();
 }
 
 export async function startExperiment(
@@ -89,25 +90,28 @@ export async function startExperiment(
 export function streamExperiment(
   runId: string,
   onEvent: (event: PipelineEvent) => void,
+  onDone?: () => void,
   onStreamError?: () => void,
 ): () => void {
   const es = createSSEStream(`/api/experiment/stream/${runId}`);
-  const handler = (ev: MessageEvent) => {
+  es.onmessage = (ev: MessageEvent) => {
     try {
-      onEvent(JSON.parse(ev.data) as PipelineEvent);
+      const parsed = JSON.parse(ev.data);
+      if (parsed.kind === "done") {
+        onDone?.();
+        es.close();
+        return;
+      }
+      if (parsed.payload) {
+        onEvent(parsed.payload as PipelineEvent);
+      }
     } catch {
       /* ignore malformed chunks */
     }
   };
-  const onError = () => {
+  es.onerror = () => {
     onStreamError?.();
     es.close();
   };
-  es.addEventListener("message", handler);
-  es.addEventListener("error", onError);
-  return () => {
-    es.removeEventListener("message", handler);
-    es.removeEventListener("error", onError);
-    es.close();
-  };
+  return () => es.close();
 }

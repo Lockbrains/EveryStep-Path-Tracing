@@ -82,6 +82,7 @@ export default function ExperimentPage() {
         runId,
         (ev) => setResults((prev) => [...prev, ev]),
         () => setStreaming(false),
+        () => setStreaming(false),
       );
       stopRef.current = () => {
         stop();

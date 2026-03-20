@@ -81,8 +81,9 @@ async def stream_pipeline(run_id: str) -> EventSourceResponse:
         while True:
             ev = await q.get()
             if ev is None:
+                yield {"data": json.dumps({"event_type": "done", "step": -1, "data": {}, "timestamp": ""})}
                 break
-            yield {"event": ev.event_type, "data": ev.model_dump_json()}
+            yield {"data": ev.model_dump_json()}
 
     return EventSourceResponse(gen())
 
@@ -121,8 +122,9 @@ async def stream_experiment(run_id: str) -> EventSourceResponse:
         while True:
             item = await q.get()
             if item is None:
+                yield {"data": json.dumps({"kind": "done"})}
                 break
-            yield {"event": str(item.get("kind", "message")), "data": json.dumps(item)}
+            yield {"data": json.dumps(item)}
 
     return EventSourceResponse(gen())
 

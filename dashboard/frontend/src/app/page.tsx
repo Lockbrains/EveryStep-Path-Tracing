@@ -87,6 +87,7 @@ export default function DashboardPage() {
           }
         },
         () => setStreaming(false),
+        () => setStreaming(false),
       );
       stopRef.current = () => {
         stop();
