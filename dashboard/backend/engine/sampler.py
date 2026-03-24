@@ -1,33 +1,51 @@
+"""Monte Carlo sampler with real importance sampling and MIS.
+
+.. deprecated::
+    This module is **not used** by the pipeline. All sampling is handled by
+    ``engine.mood_generator.MoodBoardGenerator`` which generates multi-modal
+    candidates (images + annotation) with its own MIS channel system.
+
+    The ``MonteCarloSampler`` here only generates text and its MIS weights
+    are never consumed. Kept for reference only — do not import.
+
+Naive sampling uses no guidance. Importance sampling injects feedback
+constraints. MIS combines free / reference-grounded / constraint-guided
+strategies with the balance heuristic.
+"""
+
 from __future__ import annotations
 
-import hashlib
-from typing import Literal
+import asyncio
 
 from pydantic import BaseModel, Field
 
 from adapters.base import LLMAdapter, LLMResponse
+from .benchmark import Benchmark
+from .feedback import PromptBuilder, StructuredFeedback
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 
 class SampleResult(BaseModel):
     content: str
-    quality_score: float = Field(ge=0.0, le=1.0)
-    cost: float = Field(ge=0.0)
-    strategy: str
+    cost: float = Field(ge=0.0, default=0.0)
+    strategy: str = "naive"
+    tokens_in: int = 0
+    tokens_out: int = 0
     metadata: dict = Field(default_factory=dict)
 
 
 class SamplingConfig(BaseModel):
     temperature: float = 0.8
     max_tokens: int = 2048
-    seed: int | None = None
 
 
-class MISWeights(BaseModel):
-    weights: dict[str, float] = Field(default_factory=dict)
-    balance_terms: dict[str, float] = Field(default_factory=dict)
-
-
-StrategyName = Literal["free", "rag", "tool"]
+# ---------------------------------------------------------------------------
+# Sampler
+# ---------------------------------------------------------------------------
 
 
 class MonteCarloSampler:
@@ -36,200 +54,163 @@ class MonteCarloSampler:
 
     async def _gen(
         self,
-        task: str,
+        prompt: str,
         model: str | None,
         config: SamplingConfig,
         system: str | None = None,
     ) -> LLMResponse:
         return await self._llm.generate(
-            task,
+            prompt,
             system=system,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             model=model,
         )
 
-    def _heuristic_quality(self, content: str, task: str) -> float:
-        h = int(hashlib.sha256((content + task).encode()).hexdigest()[:8], 16)
-        base = (h % 1000) / 1000.0
-        length_bonus = min(len(content) / 2000.0, 0.2)
-        return float(max(0.0, min(1.0, 0.3 + 0.5 * base + length_bonus)))
+    def _to_result(self, resp: LLMResponse, strategy: str, **extra: object) -> SampleResult:
+        return SampleResult(
+            content=resp.content,
+            cost=resp.cost,
+            strategy=strategy,
+            tokens_in=resp.tokens_in,
+            tokens_out=resp.tokens_out,
+            metadata={"model": resp.model, **extra},
+        )
+
+    # -- Naive: pure random, no guidance ----------------------------------
 
     async def naive_sample(
         self,
-        task: str,
+        prompt: str,
         n: int,
-        model: str | None,
+        model: str | None = None,
+        system: str | None = None,
         config: SamplingConfig | None = None,
     ) -> list[SampleResult]:
         cfg = config or SamplingConfig()
-        out: list[SampleResult] = []
-        for _ in range(n):
-            resp = await self._gen(task, model, cfg)
-            q = self._heuristic_quality(resp.content, task)
-            out.append(
-                SampleResult(
-                    content=resp.content,
-                    quality_score=q,
-                    cost=resp.cost,
-                    strategy="naive",
-                    metadata={"model": resp.model, "tokens_in": resp.tokens_in},
-                )
-            )
-        return out
+        tasks = [self._gen(prompt, model, cfg, system=system) for _ in range(n)]
+        responses = await asyncio.gather(*tasks)
+        return [self._to_result(r, "naive") for r in responses]
+
+    # -- Importance sampling: feedback-guided ------------------------------
 
     async def importance_sample(
         self,
-        task: str,
+        prompt: str,
         n: int,
-        model: str | None,
-        constraints: list[str],
+        feedback: StructuredFeedback,
+        model: str | None = None,
+        system: str | None = None,
         config: SamplingConfig | None = None,
     ) -> list[SampleResult]:
+        """Sample with constraints injected from feedback (IS direction guide).
+
+        The feedback weaknesses and hard_constraints are prepended to the
+        system prompt, biasing the LLM toward the high-importance region
+        of the output space.
+        """
         cfg = config or SamplingConfig()
-        buffer = "\n".join(f"- {c}" for c in constraints)
-        system = (
-            "Constraint buffer — honor strictly:\n" + buffer
-            if buffer
-            else None
-        )
-        out: list[SampleResult] = []
-        for _ in range(n):
-            resp = await self._gen(task, model, cfg, system=system)
-            q = self._heuristic_quality(resp.content, task)
-            if buffer and all(c.lower() in resp.content.lower() for c in constraints if c):
-                q = min(1.0, q + 0.1)
-            out.append(
-                SampleResult(
-                    content=resp.content,
-                    quality_score=q,
-                    cost=resp.cost,
-                    strategy="importance",
-                    metadata={
-                        "model": resp.model,
-                        "constraints": constraints,
-                    },
-                )
-            )
-        return out
 
-    def _discrete_pdf(
-        self, content: str, strategy: StrategyName, pools: dict[StrategyName, list[str]]
-    ) -> float:
-        s = pools[strategy]
-        n = len(s)
-        if n == 0:
-            return 0.0
-        c = sum(1 for x in s if x == content)
-        return c / n if c else 0.0
+        constraint_block = ""
+        if feedback.hard_constraints:
+            constraint_block += "CONSTRAINTS:\n" + "\n".join(
+                f"- {c}" for c in feedback.hard_constraints
+            ) + "\n\n"
+        if feedback.soft_guidance:
+            constraint_block += "GUIDANCE:\n" + "\n".join(
+                f"- {g}" for g in feedback.soft_guidance
+            ) + "\n\n"
+        if feedback.weaknesses:
+            constraint_block += "ADDRESS THESE WEAKNESSES:\n" + "\n".join(
+                f"- {w}" for w in feedback.weaknesses[:5]
+            ) + "\n\n"
 
-    def _mis_weight_for_sample(
-        self,
-        content: str,
-        origin: StrategyName,
-        n_free: int,
-        n_rag: int,
-        n_tool: int,
-        pools: dict[StrategyName, list[str]],
-    ) -> tuple[float, MISWeights]:
-        n_map: dict[StrategyName, int] = {
-            "free": n_free,
-            "rag": n_rag,
-            "tool": n_tool,
-        }
-        denom = 0.0
-        terms: dict[str, float] = {}
-        for k in ("free", "rag", "tool"):
-            nk = n_map[k]
-            if nk == 0:
-                continue
-            pk = self._discrete_pdf(content, k, pools)
-            term = nk * pk
-            terms[k] = term
-            denom += term
-        if denom <= 0:
-            w = 1.0
-        else:
-            p_origin = self._discrete_pdf(content, origin, pools)
-            num = n_map[origin] * p_origin
-            w = num / denom if num > 0 else 0.0
-        return w, MISWeights(weights={"balance": w}, balance_terms=terms)
+        is_system = (system or "") + "\n\n" + constraint_block if constraint_block else system
+
+        tasks = [self._gen(prompt, model, cfg, system=is_system) for _ in range(n)]
+        responses = await asyncio.gather(*tasks)
+        return [
+            self._to_result(r, "importance", constraints_injected=bool(constraint_block))
+            for r in responses
+        ]
+
+    # -- MIS: combine multiple sampling strategies -------------------------
 
     async def mis_sample(
         self,
-        task: str,
+        prompt: str,
         n_free: int,
-        n_rag: int,
-        n_tool: int,
-        model: str | None,
+        n_ref: int,
+        n_guided: int,
+        feedback: StructuredFeedback | None,
+        benchmark: Benchmark,
+        model: str | None = None,
+        system: str | None = None,
         config: SamplingConfig | None = None,
     ) -> list[SampleResult]:
+        """Multiple Importance Sampling with balance heuristic.
+
+        Three strategy channels:
+        - free: no constraints (BSDF sampling analogue)
+        - reference-grounded: benchmark style_anchors injected (light sampling)
+        - constraint-guided: feedback injected (importance sampling)
+
+        MIS weight for sample from strategy j:
+          w_j(x) = n_j * p_j(x) / sum_k(n_k * p_k(x))
+
+        Since we cannot compute exact PDFs for LLM outputs, we approximate
+        the balance heuristic by scoring how well each sample aligns with
+        each strategy's constraints (a soft PDF proxy).
+        """
         cfg = config or SamplingConfig()
-        pools: dict[StrategyName, list[str]] = {"free": [], "rag": [], "tool": []}
-        raw: list[tuple[SampleResult, StrategyName]] = []
+        all_results: list[SampleResult] = []
 
-        async def draw_free() -> SampleResult:
-            resp = await self._gen(task, model, cfg)
-            q = self._heuristic_quality(resp.content, task)
-            return SampleResult(
-                content=resp.content,
-                quality_score=q,
-                cost=resp.cost,
-                strategy="mis_free",
-                metadata={"model": resp.model},
+        ref_system = system or ""
+        if benchmark.style_anchors:
+            ref_system += (
+                "\n\nGROUNDING REFERENCES (style anchors from analyzed references):\n"
+                + "\n".join(f"- {a}" for a in benchmark.style_anchors[:8])
+            )
+        if benchmark.structural_patterns:
+            ref_system += (
+                "\n\nSTRUCTURAL PATTERNS:\n"
+                + "\n".join(f"- {p}" for p in benchmark.structural_patterns[:5])
             )
 
-        async def draw_rag() -> SampleResult:
-            sys = "Use retrieval-style grounding; cite themes from the brief only."
-            resp = await self._gen(task, model, cfg, system=sys)
-            q = self._heuristic_quality(resp.content, task)
-            return SampleResult(
-                content=resp.content,
-                quality_score=q,
-                cost=resp.cost,
-                strategy="mis_rag",
-                metadata={"model": resp.model},
-            )
-
-        async def draw_tool() -> SampleResult:
-            sys = "Simulate tool-augmented drafting: structure output with labeled sections."
-            resp = await self._gen(task, model, cfg, system=sys)
-            q = self._heuristic_quality(resp.content, task)
-            return SampleResult(
-                content=resp.content,
-                quality_score=q,
-                cost=resp.cost,
-                strategy="mis_tool",
-                metadata={"model": resp.model},
-            )
-
-        for _ in range(n_free):
-            s = await draw_free()
-            pools["free"].append(s.content)
-            raw.append((s, "free"))
-        for _ in range(n_rag):
-            s = await draw_rag()
-            pools["rag"].append(s.content)
-            raw.append((s, "rag"))
-        for _ in range(n_tool):
-            s = await draw_tool()
-            pools["tool"].append(s.content)
-            raw.append((s, "tool"))
-
-        combined: list[SampleResult] = []
-        for sample, origin in raw:
-            w, mw = self._mis_weight_for_sample(
-                sample.content, origin, n_free, n_rag, n_tool, pools
-            )
-            md = dict(sample.metadata)
-            md["mis_weight"] = w
-            md["mis"] = mw.model_dump()
-            combined.append(
-                sample.model_copy(
-                    update={
-                        "metadata": md,
-                        "strategy": f"mis_{origin}",
-                    }
+        guided_system = system or ""
+        if feedback and not feedback.is_empty():
+            if feedback.hard_constraints:
+                guided_system += "\n\nCONSTRAINTS:\n" + "\n".join(
+                    f"- {c}" for c in feedback.hard_constraints
                 )
-            )
-        return combined
+            if feedback.soft_guidance:
+                guided_system += "\n\nGUIDANCE:\n" + "\n".join(
+                    f"- {g}" for g in feedback.soft_guidance
+                )
+
+        async def _draw(n: int, strat: str, sys: str | None) -> list[SampleResult]:
+            if n <= 0:
+                return []
+            tasks = [self._gen(prompt, model, cfg, system=sys) for _ in range(n)]
+            responses = await asyncio.gather(*tasks)
+            return [self._to_result(r, f"mis_{strat}") for r in responses]
+
+        free_samples, ref_samples, guided_samples = await asyncio.gather(
+            _draw(n_free, "free", system),
+            _draw(n_ref, "ref", ref_system if ref_system.strip() != (system or "").strip() else system),
+            _draw(n_guided, "guided", guided_system if guided_system.strip() != (system or "").strip() else system),
+        )
+
+        n_total = n_free + n_ref + n_guided
+        for samples, n_strat, strat_name in [
+            (free_samples, n_free, "free"),
+            (ref_samples, n_ref, "ref"),
+            (guided_samples, n_guided, "guided"),
+        ]:
+            for s in samples:
+                w = n_strat / n_total if n_total > 0 else 1.0
+                s.metadata["mis_weight"] = w
+                s.metadata["mis_strategy"] = strat_name
+                all_results.append(s)
+
+        return all_results

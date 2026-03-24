@@ -1,78 +1,80 @@
 "use client";
 
-import ReactMarkdown from "react-markdown";
+import { useEffect, useRef } from "react";
+import type { BoardData, StepState } from "@/lib/types";
+import { MoodBoardGrid } from "./MoodBoardGrid";
 
-export type ArtBibleSection = {
-  title: string;
-  content: string;
-  status: "pending" | "generating" | "complete" | "mutating";
-  quality: number;
-  version: number;
-};
-
-const BADGE: Record<ArtBibleSection["status"], string> = {
-  pending: "bg-zinc-700 text-zinc-200",
-  generating: "animate-pulse bg-amber-500/25 text-amber-300 ring-1 ring-amber-500/40",
-  complete: "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/30",
-  mutating: "bg-blue-500/20 text-blue-300 ring-1 ring-blue-500/30",
-};
-
-function clamp01(v: number): number {
-  return Math.min(1, Math.max(0, v));
+interface ArtBiblePreviewProps {
+  steps: StepState[];
+  boards: BoardData[];
 }
 
-export function ArtBiblePreview({ sections = [] }: { sections?: ArtBibleSection[] }) {
-  if (sections.length === 0) {
+export function ArtBiblePreview({ steps, boards }: ArtBiblePreviewProps) {
+  const endRef = useRef<HTMLDivElement>(null);
+  const completedSteps = steps.filter((s) => s.status === "complete");
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [completedSteps.length]);
+
+  if (completedSteps.length === 0) {
     return (
-      <div className="flex h-48 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-sm text-zinc-500">
-        No sections
+      <div className="flex h-full min-h-[200px] items-center justify-center text-sm text-zinc-600">
+        Mood boards will appear here as the pipeline generates them
       </div>
     );
   }
 
   return (
-    <div className="max-h-[min(70vh,640px)] overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-900 p-3">
-      <div className="flex flex-col gap-3">
-        {sections.map((s, i) => (
-          <article key={`${s.title}-${i}`} className="rounded-lg border border-zinc-800 bg-zinc-800/60 p-4">
-            {s.status === "generating" ? (
-              <div className="mb-3 h-0.5 w-full animate-pulse rounded-full bg-amber-500/45" aria-hidden />
-            ) : null}
-            <div className="mb-2 flex flex-wrap items-center gap-2">
-              <h3 className="text-base font-semibold text-zinc-100">{s.title}</h3>
-              <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${BADGE[s.status]}`}>{s.status}</span>
-              <span className="ml-auto text-xs text-zinc-500">v{s.version}</span>
+    <div className="space-y-4 overflow-y-auto">
+      {completedSteps.map((s) => {
+        const board = boards.find((b) => b.stepIndex === s.step - 1);
+        const imgIds = board?.imageIds ?? s.boardImageIds;
+        const annotation = board?.annotation ?? s.boardAnnotation;
+
+        return (
+          <div
+            key={s.step}
+            className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-4"
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <h4 className="text-xs font-semibold text-zinc-200">
+                <span className="mr-1.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-zinc-800 text-[10px] tabular-nums text-zinc-400">
+                  {s.step}
+                </span>
+                {s.title}
+              </h4>
+              {s.finalScore != null && (
+                <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] tabular-nums text-zinc-400">
+                  Q: {s.finalScore.toFixed(3)}
+                </span>
+              )}
             </div>
-            <div className="text-sm text-zinc-300 [&_a]:text-emerald-400 [&_a]:underline [&_h2]:mb-2 [&_h2]:mt-3 [&_h2]:text-base [&_h2]:font-semibold [&_h2]:text-zinc-100 [&_h3]:mb-1 [&_h3]:mt-2 [&_h3]:text-sm [&_h3]:font-semibold [&_h3]:text-zinc-100">
-              <ReactMarkdown
-                components={{
-                  p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                  ul: ({ children }) => <ul className="mb-2 list-inside list-disc">{children}</ul>,
-                  ol: ({ children }) => <ol className="mb-2 list-inside list-decimal">{children}</ol>,
-                  li: ({ children }) => <li className="mb-1">{children}</li>,
-                  code: ({ children }) => (
-                    <code className="rounded bg-zinc-900 px-1 py-0.5 font-mono text-xs text-amber-200">{children}</code>
-                  ),
-                }}
-              >
-                {s.content || "_Empty_"}
-              </ReactMarkdown>
-            </div>
-            <div className="mt-3">
-              <div className="mb-1 flex justify-between text-xs text-zinc-500">
-                <span>quality</span>
-                <span>{(clamp01(s.quality) * 100).toFixed(0)}%</span>
+
+            <MoodBoardGrid imageIds={imgIds} annotation={annotation} />
+
+            {s.finalDimensions.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {s.finalDimensions.map((d) => (
+                  <span
+                    key={d.dimension}
+                    className={`rounded-full px-2 py-0.5 text-[9px] ${
+                      d.score >= 0.7
+                        ? "bg-emerald-900/30 text-emerald-400"
+                        : d.score >= 0.4
+                          ? "bg-amber-900/30 text-amber-400"
+                          : "bg-red-900/30 text-red-400"
+                    }`}
+                  >
+                    {d.dimension}: {d.score.toFixed(2)}
+                  </span>
+                ))}
               </div>
-              <div className="h-1.5 w-full overflow-hidden rounded bg-zinc-900">
-                <div
-                  className="h-full rounded bg-emerald-500 transition-all duration-500"
-                  style={{ width: `${clamp01(s.quality) * 100}%` }}
-                />
-              </div>
-            </div>
-          </article>
-        ))}
-      </div>
+            )}
+          </div>
+        );
+      })}
+      <div ref={endRef} />
     </div>
   );
 }

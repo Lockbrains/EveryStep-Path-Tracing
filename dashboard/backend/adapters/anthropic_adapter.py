@@ -5,7 +5,7 @@ import time
 
 from anthropic import AsyncAnthropic
 
-from .base import LLMAdapter, LLMResponse
+from .base import ImageInput, LLMAdapter, LLMResponse
 
 HAIKU_INPUT_PER_1M = 0.80
 HAIKU_OUTPUT_PER_1M = 4.00
@@ -35,6 +35,7 @@ class AnthropicAdapter(LLMAdapter):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         model: str | None = None,
+        images: list[ImageInput] | None = None,
     ) -> LLMResponse:
         m = model or self.default_model
         if not self._client:
@@ -47,12 +48,26 @@ class AnthropicAdapter(LLMAdapter):
                 latency_ms=0.0,
             )
         t0 = time.perf_counter()
+
+        content_blocks: list[dict] = []
+        if images:
+            for img in images:
+                content_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": img.mime_type,
+                        "data": img.data,
+                    },
+                })
+        content_blocks.append({"type": "text", "text": prompt})
+
         msg = await self._client.messages.create(
             model=m,
             max_tokens=max_tokens,
             temperature=temperature,
             system=system or "",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": content_blocks}],
         )
         latency_ms = (time.perf_counter() - t0) * 1000
         block = msg.content[0]

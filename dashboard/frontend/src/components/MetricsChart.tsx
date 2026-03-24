@@ -1,172 +1,219 @@
 "use client";
 
-import { useId } from "react";
 import {
-  Area,
-  AreaChart,
-  Bar,
   BarChart,
-  CartesianGrid,
-  Cell,
-  Legend,
-  Line,
+  Bar,
   LineChart,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
+  Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  Legend,
 } from "recharts";
+import type { MLTData, StepState } from "@/lib/types";
 
-export type MetricsSnapshot = {
-  timestamp: string;
-  totalSamples: number;
-  bestQuality: number;
-  averageQuality: number;
-  totalCost: number;
-  totalTokens: number;
-  pathsActive: number;
-  pathsTerminated: number;
-  pathsAccepted: number;
-  misWeights: { free: number; rag: number; tool: number };
-};
-
-const axisTick = { fill: "#a1a1aa", fontSize: 11 };
-const gridStroke = "#27272a";
-const tooltipStyle = {
-  backgroundColor: "#18181b",
-  border: "1px solid #3f3f46",
-  borderRadius: 8,
-  color: "#f4f4f5",
-};
-
-function EmptyPanel({ label }: { label: string }) {
-  return (
-    <div className="flex h-full min-h-[200px] items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-sm text-zinc-500">
-      {label}
-    </div>
-  );
+interface QualityPoint {
+  step: string;
+  bestQ: number;
+  avgQ: number;
 }
 
-export function MetricsChart({ snapshots = [] }: { snapshots?: MetricsSnapshot[] }) {
-  const costGradId = `esCostFill-${useId().replace(/:/g, "")}`;
-  const qualityData = snapshots.map((s) => ({
-    totalSamples: s.totalSamples,
-    bestQuality: s.bestQuality,
-    averageQuality: s.averageQuality,
-  }));
+interface RRPoint {
+  step: string;
+  samples: number;
+  survived: number;
+  pruned: number;
+  retries: number;
+  images: number;
+}
 
-  const costData = snapshots.map((s) => ({
-    totalSamples: s.totalSamples,
-    totalCost: s.totalCost,
-  }));
+function buildData(steps: StepState[]) {
+  const quality: QualityPoint[] = [];
+  const rr: RRPoint[] = [];
 
-  const pathData = snapshots.map((s) => ({
-    timestamp: s.timestamp,
-    active: s.pathsActive,
-    terminated: s.pathsTerminated,
-    accepted: s.pathsAccepted,
-  }));
+  for (const s of steps) {
+    if (s.status === "pending") continue;
+    const aggregates = s.scoring?.all_aggregates ?? [];
+    const best =
+      aggregates.length > 0
+        ? Math.max(...aggregates)
+        : (s.finalScore ?? 0);
+    const avg =
+      aggregates.length > 0
+        ? aggregates.reduce((a, b) => a + b, 0) / aggregates.length
+        : best;
 
-  const lastMis = snapshots.length ? snapshots[snapshots.length - 1]!.misWeights : { free: 0, rag: 0, tool: 0 };
-  const pieData = [
-    { name: "free", value: lastMis.free, fill: "#3b82f6" },
-    { name: "rag", value: lastMis.rag, fill: "#f59e0b" },
-    { name: "tool", value: lastMis.tool, fill: "#10b981" },
-  ];
-  const pieSum = pieData.reduce((a, b) => a + b.value, 0);
+    quality.push({ step: `S${s.step}`, bestQ: best, avgQ: avg });
+
+    const survived = s.rr?.continue ? 1 : 0;
+    rr.push({
+      step: `S${s.step}`,
+      samples: s.samples.length,
+      survived,
+      pruned: s.rr && !s.rr.continue ? 1 : 0,
+      retries: s.attempt,
+      images: s.boardImageIds.length,
+    });
+  }
+
+  return { quality, rr };
+}
+
+export function MetricsChart({
+  steps,
+  mlt,
+}: {
+  steps: StepState[];
+  mlt?: MLTData | null;
+}) {
+  const { quality, rr } = buildData(steps);
+
+  if (quality.length === 0) {
+    return (
+      <div className="flex h-full min-h-[120px] items-center justify-center text-sm text-zinc-600">
+        Metrics will appear as the pipeline progresses
+      </div>
+    );
+  }
+
+  const mltData =
+    mlt?.score_history?.map((sc, i) => ({ iter: i, score: sc })) ?? [];
 
   return (
-    <div className="grid w-full grid-cols-1 gap-4 md:grid-cols-2">
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
-        <div className="mb-2 text-sm font-medium text-zinc-100">Quality Convergence (SPP analogue)</div>
-        {qualityData.length === 0 ? (
-          <EmptyPanel label="No data" />
-        ) : (
-          <div className="h-[220px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={qualityData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                <CartesianGrid stroke={gridStroke} strokeDasharray="3 3" />
-                <XAxis dataKey="totalSamples" type="number" tick={axisTick} stroke="#3f3f46" />
-                <YAxis domain={[0, 1]} tick={axisTick} stroke="#3f3f46" width={36} />
-                <Tooltip contentStyle={tooltipStyle} labelStyle={{ color: "#e4e4e7" }} />
-                <Legend wrapperStyle={{ color: "#a1a1aa", fontSize: 12 }} />
-                <Line type="monotone" dataKey="bestQuality" name="best" stroke="#10b981" strokeWidth={2} dot={false} isAnimationActive />
-                <Line type="monotone" dataKey="averageQuality" name="average" stroke="#a1a1aa" strokeWidth={2} dot={false} isAnimationActive />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        )}
+    <div
+      className={`grid gap-4 ${mltData.length > 0 ? "sm:grid-cols-2 lg:grid-cols-3" : "sm:grid-cols-2"}`}
+    >
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+        <p className="mb-2 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+          Quality per Step
+        </p>
+        <ResponsiveContainer width="100%" height={160}>
+          <LineChart data={quality}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+            <XAxis dataKey="step" tick={{ fontSize: 10, fill: "#71717a" }} />
+            <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: "#71717a" }} />
+            <Tooltip
+              contentStyle={{
+                background: "#18181b",
+                border: "1px solid #3f3f46",
+                fontSize: 11,
+              }}
+            />
+            <Legend wrapperStyle={{ fontSize: 10 }} />
+            <Line
+              type="monotone"
+              dataKey="bestQ"
+              name="Best"
+              stroke="#10b981"
+              strokeWidth={2}
+              dot={{ r: 3 }}
+            />
+            <Line
+              type="monotone"
+              dataKey="avgQ"
+              name="Avg"
+              stroke="#f59e0b"
+              strokeWidth={1.5}
+              strokeDasharray="4 2"
+              dot={{ r: 2 }}
+            />
+          </LineChart>
+        </ResponsiveContainer>
       </div>
 
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
-        <div className="mb-2 text-sm font-medium text-zinc-100">Cumulative Token Cost</div>
-        {costData.length === 0 ? (
-          <EmptyPanel label="No data" />
-        ) : (
-          <div className="h-[220px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={costData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id={costGradId} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.55} />
-                    <stop offset="100%" stopColor="#f59e0b" stopOpacity={0.05} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke={gridStroke} strokeDasharray="3 3" />
-                <XAxis dataKey="totalSamples" type="number" tick={axisTick} stroke="#3f3f46" />
-                <YAxis tick={axisTick} stroke="#3f3f46" width={44} />
-                <Tooltip contentStyle={tooltipStyle} />
-                <Area type="monotone" dataKey="totalCost" stroke="#f59e0b" fill={`url(#${costGradId})`} strokeWidth={2} isAnimationActive />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        )}
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+        <p className="mb-2 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+          Samples, RR & Images
+        </p>
+        <ResponsiveContainer width="100%" height={160}>
+          <BarChart data={rr}>
+            <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+            <XAxis dataKey="step" tick={{ fontSize: 10, fill: "#71717a" }} />
+            <YAxis
+              allowDecimals={false}
+              tick={{ fontSize: 10, fill: "#71717a" }}
+            />
+            <Tooltip
+              contentStyle={{
+                background: "#18181b",
+                border: "1px solid #3f3f46",
+                fontSize: 11,
+              }}
+            />
+            <Legend wrapperStyle={{ fontSize: 10 }} />
+            <Bar
+              dataKey="samples"
+              name="Samples"
+              fill="#3b82f6"
+              radius={[2, 2, 0, 0]}
+            />
+            <Bar
+              dataKey="images"
+              name="Images"
+              fill="#8b5cf6"
+              radius={[2, 2, 0, 0]}
+            />
+            <Bar
+              dataKey="survived"
+              name="RR Pass"
+              fill="#10b981"
+              radius={[2, 2, 0, 0]}
+            />
+            <Bar
+              dataKey="pruned"
+              name="RR Cut"
+              fill="#ef4444"
+              radius={[2, 2, 0, 0]}
+            />
+            <Bar
+              dataKey="retries"
+              name="Retries"
+              fill="#f59e0b"
+              radius={[2, 2, 0, 0]}
+            />
+          </BarChart>
+        </ResponsiveContainer>
       </div>
 
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
-        <div className="mb-2 text-sm font-medium text-zinc-100">Path Exploration</div>
-        {pathData.length === 0 ? (
-          <EmptyPanel label="No data" />
-        ) : (
-          <div className="h-[220px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={pathData} margin={{ top: 8, right: 12, left: 0, bottom: 24 }}>
-                <CartesianGrid stroke={gridStroke} strokeDasharray="3 3" />
-                <XAxis dataKey="timestamp" tick={axisTick} stroke="#3f3f46" interval="preserveStartEnd" />
-                <YAxis tick={axisTick} stroke="#3f3f46" width={36} />
-                <Tooltip contentStyle={tooltipStyle} />
-                <Legend wrapperStyle={{ color: "#a1a1aa", fontSize: 12 }} />
-                <Bar dataKey="active" name="active" stackId="paths" fill="#71717a" isAnimationActive />
-                <Bar dataKey="terminated" name="terminated" stackId="paths" fill="#ef4444" isAnimationActive />
-                <Bar dataKey="accepted" name="accepted" stackId="paths" fill="#10b981" isAnimationActive />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-      </div>
-
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-3">
-        <div className="mb-2 text-sm font-medium text-zinc-100">MIS Strategy Distribution</div>
-        {pieSum <= 0 ? (
-          <EmptyPanel label="No data" />
-        ) : (
-          <div className="h-[220px] w-full">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Tooltip contentStyle={tooltipStyle} />
-                <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={72} paddingAngle={2} isAnimationActive>
-                  {pieData.map((e) => (
-                    <Cell key={e.name} fill={e.fill} stroke="#27272a" strokeWidth={1} />
-                  ))}
-                </Pie>
-                <Legend wrapperStyle={{ color: "#a1a1aa", fontSize: 12 }} />
-              </PieChart>
-            </ResponsiveContainer>
-          </div>
-        )}
-      </div>
+      {mltData.length > 0 && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3">
+          <p className="mb-2 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+            MLT Refinement ({mlt?.accepted ?? 0}A / {mlt?.rejected ?? 0}R)
+          </p>
+          <ResponsiveContainer width="100%" height={160}>
+            <LineChart data={mltData}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+              <XAxis
+                dataKey="iter"
+                tick={{ fontSize: 10, fill: "#71717a" }}
+              />
+              <YAxis
+                domain={[0, 1]}
+                tick={{ fontSize: 10, fill: "#71717a" }}
+              />
+              <Tooltip
+                contentStyle={{
+                  background: "#18181b",
+                  border: "1px solid #3f3f46",
+                  fontSize: 11,
+                }}
+              />
+              <Line
+                type="monotone"
+                dataKey="score"
+                name="Quality"
+                stroke="#8b5cf6"
+                strokeWidth={2}
+                dot={{ r: 2 }}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
     </div>
   );
 }

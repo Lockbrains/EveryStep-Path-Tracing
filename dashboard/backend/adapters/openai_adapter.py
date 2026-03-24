@@ -5,7 +5,7 @@ import time
 
 from openai import AsyncOpenAI
 
-from .base import LLMAdapter, LLMResponse
+from .base import ImageInput, LLMAdapter, LLMResponse
 
 GPT4O_MINI_INPUT_PER_1M = 0.15
 GPT4O_MINI_OUTPUT_PER_1M = 0.60
@@ -35,6 +35,7 @@ class OpenAIAdapter(LLMAdapter):
         temperature: float = 0.7,
         max_tokens: int = 4096,
         model: str | None = None,
+        images: list[ImageInput] | None = None,
     ) -> LLMResponse:
         m = model or self.default_model
         if not self._client:
@@ -47,16 +48,33 @@ class OpenAIAdapter(LLMAdapter):
                 latency_ms=0.0,
             )
         t0 = time.perf_counter()
-        kwargs: dict = {
-            "model": m,
-            "messages": (
-                [{"role": "system", "content": system}] if system else []
-            )
-            + [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        resp = await self._client.chat.completions.create(**kwargs)
+
+        user_content: list[dict] | str
+        if images:
+            parts: list[dict] = [{"type": "text", "text": prompt}]
+            for img in images:
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{img.mime_type};base64,{img.data}",
+                        "detail": "low",
+                    },
+                })
+            user_content = parts
+        else:
+            user_content = prompt
+
+        messages: list[dict] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": user_content})
+
+        resp = await self._client.chat.completions.create(
+            model=m,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
         latency_ms = (time.perf_counter() - t0) * 1000
         choice = resp.choices[0]
         content = choice.message.content or ""
